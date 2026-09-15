@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  spark-master:
+    image: apache/spark:4.2.0
+    hostname: spark-master
+    ports:
+      - "4040:4040"
+      - "7077:7077"
+    # BYPASS WRAPPER: Direct execution prevents background-daemon exits
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    networks:
+      - spark-net
+    volumes:
+      - /mnt/spark:/opt/spark/data:ro
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  spark-worker:
+    image: apache/spark:4.2.0
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      - SPARK_WORKER_MEMORY=2G   # Lowered to 1G temporarily to ensure no OOM spikes during initialization
+      - SPARK_WORKER_CORES=4
+    networks:
+      - spark-net
+    volumes:
+      - /mnt/spark:/opt/spark/data:ro
+    deploy:
+      mode: replicated
+      replicas: 2
+      placement:
+        max_replicas_per_node: 1  # Ensures 1 worker container per physical RPi
+        constraints:
+          - node.role == worker
+
+networks:
+  spark-net:
+    driver: overlay
+
+#volumes:
+ # spark-data:
+  #  - type: bind
+   #     source: /mnt/spark
+    #    read_only: true

@@ -17,8 +17,9 @@
 
 package org.apache.spark.examples;
 
+import org.jspecify.annotations.NonNull;
+import scala.Tuple1;
 import scala.Tuple2;
-import scala.Tuple3;
 
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
@@ -26,19 +27,19 @@ import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.sql.SparkSession;
 
 import java.io.Serializable;
-import java.util.Arrays;
-import java.util.List;
+import java.time.OffsetDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
  * Executes a roll up-style query against Apache logs.
- *
  * Usage: JavaLogQuery [logFile]
  */
 public final class JavaLogQuery {
 
-  public static final List<String> exampleApacheLogs = Arrays.asList(
+  private static final List<String> exampleApacheLogs = Arrays.asList(
     "10.10.10.10 - \"FRED\" [18/Jan/2013:17:56:07 +1100] \"GET http://images.com/2013/Generic.jpg " +
       "HTTP/1.1\" 304 315 \"http://referall.com/\" \"Mozilla/4.0 (compatible; MSIE 7.0; " +
       "Windows NT 5.1; GTB7.4; .NET CLR 2.0.50727; .NET CLR 3.0.04506.30; .NET CLR 3.0.04506.648; " +
@@ -52,71 +53,130 @@ public final class JavaLogQuery {
       "3.5.30729; Release=ARP)\" \"UD-1\" - \"image/jpeg\" \"whatever\" 0.352 \"-\" - \"\" 256 977 988 \"\" " +
       "0 73.23.2.15 images.com 1358492557 - Whatup");
 
-  public static final Pattern apacheLogRegex = Pattern.compile(
-    "^([\\d.]+) (\\S+) (\\S+) \\[([\\w\\d:/]+\\s[+\\-]\\d{4})\\] \"(.+?)\" (\\d{3}) ([\\d\\-]+) \"([^\"]+)\" \"([^\"]+)\".*");
+  private static final Pattern apacheLogRegex = Pattern.compile(
+          "^([\\d.]+) (\\S+) (\\S+) \\[([\\w\\d:/]+\\s[+\\-]\\d{3,4})\\] \"(.+?)\" (\\d{3}) ([\\d\\-]+) \"([^\"]+)\" \"([^\"]+)\".*");
+    private static final DateTimeFormatter ACCESS_LOG_TIME_FORMATTER =
+          DateTimeFormatter.ofPattern("d/MMM/yyyy:HH:mm:ss Z", Locale.ENGLISH);
 
-  /** Tracks the total query count and number of aggregate bytes for a particular group. */
-  public static class Stats implements Serializable {
+  private record AccessStatistics(String ip,
+                                  OffsetDateTime startTime,
+                                  OffsetDateTime endTime,
+                                  long count,
+                                  String query,
+                                  String statusCode,
+                                  long bytes,
+                                  String userAgent,
+                                  String users)
+          implements Serializable, Comparable<AccessStatistics> {
 
-    private final int count;
-    private final int numBytes;
-
-    public Stats(int count, int numBytes) {
-      this.count = count;
-      this.numBytes = numBytes;
-    }
-    public Stats merge(Stats other) {
-      return new Stats(count + other.count, numBytes + other.numBytes);
+    private AccessStatistics merge(AccessStatistics other) {
+      String status = statusCode.contains(other.statusCode) ? statusCode : statusCode + "," + other.statusCode;
+      String newUsers = users.contains(other.users) ? users : users + ", " + other.users;
+      String newUserAgent = userAgent.contains(other.userAgent) ? userAgent : userAgent + ", " + other.userAgent;
+      var start = startTime.isBefore(other.startTime) ? startTime : other.startTime;
+      var end = endTime.isAfter(other.endTime) ? endTime : other.endTime;
+      return new AccessStatistics(ip, start, end, count + other.count, query, status,
+              bytes + other.bytes, newUserAgent, newUsers);
     }
 
     @Override
-    public String toString() {
-      return String.format("bytes=%s\tn=%s", numBytes, count);
+    public @NonNull String toString() {
+      var user = (users.length() > 75) ? (users.substring(0, 75) + " ...") : users;
+      var agents = (userAgent.length() > 50) ? (userAgent.substring(0, 50) + " ...") : userAgent;
+      return String.format("ip=%s\tn=%s\tstart=%s\tend=%s\tstatus=%s\tkilobytes=%s\tusers=%s\tquery=%s\tagent=%s",
+              ip, count, startTime, endTime,  statusCode, bytes/1000, user, query, agents);
+    }
+
+    @Override
+    public int compareTo(AccessStatistics other) {
+      return Long.compare(this.count, other.count);
     }
   }
 
-  public static Tuple3<String, String, String> extractKey(String line) {
+  private static Tuple1<String> extractIpKey(String line) {
     Matcher m = apacheLogRegex.matcher(line);
     if (m.find()) {
-      String ip = m.group(1);
-      String user = m.group(3);
-      String query = m.group(5);
-      if (!user.equalsIgnoreCase("-")) {
-        return new Tuple3<>(ip, user, query);
-      }
+      return new Tuple1<>(m.group(1));
     }
-    return new Tuple3<>(null, null, null);
+    return new Tuple1<>(null);
   }
 
-  public static Stats extractStats(String line) {
-    Matcher m = apacheLogRegex.matcher(line);
-    if (m.find()) {
-      int bytes = Integer.parseInt(m.group(7));
-      return new Stats(1, bytes);
+  private static AccessStatistics extractCountUserStats(String line) {
+    Matcher matcher = apacheLogRegex.matcher(line);
+    if (matcher.find()) {
+      String ip = matcher.group(1);
+      String user = matcher.group(3);
+      OffsetDateTime dateTime = getOffsetDateTime(matcher);
+      String query = matcher.group(5);
+      String status = matcher.group(6);
+      long bytes = Long.parseLong(matcher.group(7));
+      String userAgent = matcher.group(9);
+      return new AccessStatistics(ip, dateTime, dateTime, 1, query ,
+              status, bytes, userAgent, user);
     } else {
-      return new Stats(1, 0);
+      return new AccessStatistics("", OffsetDateTime.MAX, OffsetDateTime.MIN, 1, "",
+              "", 0, "", "");
     }
+  }
+
+  private static @NonNull OffsetDateTime getOffsetDateTime(Matcher m) {
+    String timeStamp = m.group(4);
+    // Normaliseer timezone: +000 -> +0000, -000 -> -0000
+    timeStamp = timeStamp.replaceAll("([+\\-])(\\d{3})$", "$1$20");
+    return OffsetDateTime.parse(timeStamp, ACCESS_LOG_TIME_FORMATTER);
+  }
+
+  private static @NonNull OffsetDateTime getOffsetDateTimeRemove(Matcher m) {
+    String timeStampWithBrackets = m.group(4);
+    String timeStamp = timeStampWithBrackets.substring(1, timeStampWithBrackets.length() - 1); // remove brackets
+    return OffsetDateTime.parse(timeStamp, ACCESS_LOG_TIME_FORMATTER);
   }
 
   public static void main(String[] args) {
     SparkSession spark = SparkSession
-      .builder()
-      .appName("JavaLogQuery")
-      .getOrCreate();
+            .builder()
+            .appName("JavaLogQuery")
+            .getOrCreate();
 
-    JavaSparkContext jsc = new JavaSparkContext(spark.sparkContext());
-
-    JavaRDD<String> dataSet = (args.length == 1) ? jsc.textFile(args[0]) : jsc.parallelize(exampleApacheLogs);
-
-    JavaPairRDD<Tuple3<String, String, String>, Stats> extracted =
-        dataSet.mapToPair(s -> new Tuple2<>(extractKey(s), extractStats(s)));
-
-    JavaPairRDD<Tuple3<String, String, String>, Stats> counts = extracted.reduceByKey(Stats::merge);
-
-    List<Tuple2<Tuple3<String, String, String>, Stats>> output = counts.collect();
-    for (Tuple2<?,?> t : output) {
-      System.out.println(t._1() + "\t" + t._2());
+    JavaRDD<String> dataSet;
+    try (JavaSparkContext jsc = new JavaSparkContext(spark.sparkContext())) {
+      long limit = (args.length >= 2) ? Long.parseLong(args[1]) : 1;
+      Optional<String> statusCode = (args.length >= 3) ? Optional.of(args[2]) : Optional.empty();
+      dataSet = (args.length >= 1) ? jsc.textFile(args[0]) : jsc.parallelize(exampleApacheLogs);
+      generateResults(dataSet, limit, statusCode);
+      spark.stop();
+    } catch (Exception e) {
+      System.err.println("Error: " + e.getMessage());
     }
-    spark.stop();
+  }
+
+  private static void generateResults(JavaRDD<String> dataSet, long limit, Optional<String> statusCodeFilter) {
+
+    JavaPairRDD<Tuple1<String>, AccessStatistics> extracted =
+            dataSet.mapToPair(s -> new Tuple2<>(extractIpKey(s), extractCountUserStats(s)));
+
+    JavaPairRDD<Tuple1<String>, AccessStatistics> counts = extracted.reduceByKey(AccessStatistics::merge);
+
+    List<AccessStatistics> allhits = new ArrayList<>(counts.values().collect());
+    Collections.sort(allhits);
+    var output = allhits
+            .stream()
+            .filter(statusCodeFilter.isPresent() ? stat -> stat.statusCode.contains(statusCodeFilter.get()) : s -> true)
+            .filter(stat -> stat.count > limit)
+            .toList();
+
+    System.out.println("======================================================================================================");
+    System.out.println("Results:");
+    System.out.println("======================================================================================================");
+
+    output.forEach(System.out::println);
+
+    System.out.println("======================================================================================================");
+    System.out.println("Number of requests: " + dataSet.count());
+    System.out.println("======================================================================================================");
+    System.out.println("Number of distinct ip's: " + allhits.size());
+    System.out.println("======================================================================================================");
+    System.out.println("ip's with more than " + limit + " hits: " + output.size());
+    System.out.println("======================================================================================================");
   }
 }

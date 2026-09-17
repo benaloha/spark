@@ -1,7 +1,7 @@
 Ontwikkel:
 
 bash:
-sbt
+build/sbt
 
 sbt-cli (snelste delta compiles)
 project example

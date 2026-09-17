@@ -126,12 +126,6 @@ public final class JavaLogQuery {
     return OffsetDateTime.parse(timeStamp, ACCESS_LOG_TIME_FORMATTER);
   }
 
-  private static @NonNull OffsetDateTime getOffsetDateTimeRemove(Matcher m) {
-    String timeStampWithBrackets = m.group(4);
-    String timeStamp = timeStampWithBrackets.substring(1, timeStampWithBrackets.length() - 1); // remove brackets
-    return OffsetDateTime.parse(timeStamp, ACCESS_LOG_TIME_FORMATTER);
-  }
-
   public static void main(String[] args) {
     SparkSession spark = SparkSession
             .builder()
@@ -143,7 +137,10 @@ public final class JavaLogQuery {
       long limit = (args.length >= 2) ? Long.parseLong(args[1]) : 1;
       Optional<String> statusCode = (args.length >= 3) ? Optional.of(args[2]) : Optional.empty();
       dataSet = (args.length >= 1) ? jsc.textFile(args[0]) : jsc.parallelize(exampleApacheLogs);
+      //dataSet.repartition(80); werkt niet.
+
       generateResults(dataSet, limit, statusCode);
+      System.in.read(); // to keep webUI up
       spark.stop();
     } catch (Exception e) {
       System.err.println("Error: " + e.getMessage());
@@ -171,8 +168,8 @@ public final class JavaLogQuery {
 
     output.forEach(System.out::println);
 
-    System.out.println("======================================================================================================");
-    System.out.println("Number of requests: " + dataSet.count());
+    //System.out.println("======================================================================================================");
+    //System.out.println("Number of requests: " + dataSet.count()); takes time.
     System.out.println("======================================================================================================");
     System.out.println("Number of distinct ip's: " + allhits.size());
     System.out.println("======================================================================================================");
